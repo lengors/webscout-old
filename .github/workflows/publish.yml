@@ -1,0 +1,38 @@
+---
+name: Publish image
+
+on:
+    workflow_dispatch:
+
+env:
+    REGISTRY: ghcr.io
+
+jobs:
+    publish:
+        name: Publish image
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            packages: write
+            id-token: write
+
+        steps:
+            - name: Checkout repositoriy
+              uses: actions/checkout@v4
+            # - name: Install cosign
+            #   uses: sigstore/cosign-installer@v3.7.0
+            #   with:
+            #       cosign-release: "v2.4.1"
+            - name: Setup gradle
+              uses: gradle/actions/setup-gradle@v3
+            - name: Build and publish image
+              run: ./gradlew clean bootBuildImage --publishImage
+              env:
+                  DOKCER_PUBLISH_REGISTRY_URL: ${{ env.REGISTRY }}
+                  DOKCER_PUBLISH_REGISTRY_USERNAME: ${{ github.actor }}
+                  DOKCER_PUBLISH_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            # - name: Sign the published Docker image
+            #   env:
+            #       TAGS: ${{ steps.meta.outputs.tags }}
+            #       DIGEST: ${{ steps.build-and-push.outputs.digest }}
+            #   run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}

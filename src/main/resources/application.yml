@@ -1,0 +1,39 @@
+server:
+    port: ${SERVER_PORT:8080}
+
+spring:
+    application:
+        name: webscout
+    webflux:
+        base-path: /api
+    threads:
+        virtual:
+            enabled: true
+    liquibase:
+        change-log: classpath:/db/db.changelog-master.yml
+        url: jdbc:${DATABASE_URL:postgresql://localhost:5432/webscout}
+        user: ${DATABASE_USERNAME:postgres}
+        password: ${DATABASE_PASSWORD:}
+    cache:
+        caffeine:
+            spec: expireAfterAccess=1h
+        cache-names: Scrapers
+        type: caffeine
+    r2dbc:
+        url: r2dbc:${DATABASE_URL:postgresql://localhost:5432/webscout}
+        username: ${DATABASE_USERNAME:postgres}
+        password: ${DATABASE_PASSWORD:}
+
+management:
+    otlp:
+        tracing:
+            endpoint: ${MANAGEMENT_OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+            export:
+                enabled: ${MANAGEMENT_OTLP_TRACING_EXPORT_ENABLED:true}
+    tracing:
+        sampling:
+            probability: ${MANAGEMENT_TRACING_SAMPLING_PROBABILITY:1.0}
+
+duckling:
+    client:
+        url: ${DUCKLING_CLIENT_URL:http://localhost:8000}
