@@ -32,12 +32,15 @@ import io.github.lengors.webscout.domain.scrapers.specifications.events.ScraperS
 import io.github.lengors.webscout.domain.scrapers.specifications.events.ScraperSpecificationEntityCreatedEvent
 import io.github.lengors.webscout.domain.scrapers.specifications.events.ScraperSpecificationEntityEvent
 import io.github.lengors.webscout.domain.scrapers.specifications.events.ScraperSpecificationPersistenceEvent
+import io.micrometer.core.instrument.kotlin.asContextElement
+import io.micrometer.observation.ObservationRegistry
 import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.apache.commons.jexl3.JexlEngine
 import org.slf4j.LoggerFactory
 import org.springframework.cache.annotation.CacheEvict
@@ -53,6 +56,7 @@ class ScraperService(
     private val jexlEngine: JexlEngine,
     private val sslMaterialLoader: SslMaterialLoader,
     private val httpStatefulClientBuilder: HttpStatefulClientBuilder,
+    private val observationRegistry: ObservationRegistry,
     @Lazy private val self: ScraperService? = null,
 ) : EventListener<ScraperSpecificationPersistenceEvent> {
     companion object {
@@ -89,10 +93,12 @@ class ScraperService(
     suspend fun SendChannel<ScraperResponse>.scrap(scraperTasks: Iterable<ScraperTask>) = scrap(scraperTasks.asFlow())
 
     suspend fun SendChannel<ScraperResponse>.scrap(scraperTasks: Flow<ScraperTask>) =
-        coroutineScope {
-            scraperTasks.collect {
-                launch {
-                    scrap(it)
+        withContext(observationRegistry.asContextElement()) {
+            coroutineScope {
+                scraperTasks.collect {
+                    launch {
+                        scrap(it)
+                    }
                 }
             }
         }
@@ -159,242 +165,243 @@ class ScraperService(
         scrap(scraperContext.copy(gates = defaultGates))
     }
 
-    private suspend fun SendChannel<ScraperResponse>.scrap(scraperContext: ScraperContext) {
-        val scraperHandler =
-            runCatching(logger, {
-                when (it) {
-                    is ScraperHandlerNotFoundException ->
-                        ScraperResponseError(
-                            ScraperResponseErrorCode.HANDLER_NOT_FOUND,
-                            scraperContext.scraper.name,
-                            null,
-                            "Could not find an handler for specification '${scraperContext.scraper.name}'",
-                        )
-
-                    else ->
-                        ScraperResponseError(
-                            ScraperResponseErrorCode.COMPUTE_HANDLER,
-                            scraperContext.scraper.name,
-                            null,
-                            it.message,
-                        )
-                }
-            }) {
-                with(scraperContext) {
-                    scraper.handlers.firstOrNull { handler ->
-                        handler.matches?.takeUnless { it.compute(Boolean::class).valueOrNull == true } == null &&
-                            handler.requiresGates
-                                .compute(String::class)
-                                .mapNotNull { it.valueOrNull }
-                                .let(gates::containsAll)
-                    }
-                } ?: throw ScraperHandlerNotFoundException(scraperContext.scraper.name)
-            } ?: return
-
-        logger.info("Scraper handler: (name={})", scraperHandler.name)
-
-        when (scraperHandler.action) {
-            is ScraperFlatAction ->
-                runCatching(logger, {
-                    ScraperResponseError(
-                        ScraperResponseErrorCode.COMPUTE_FLAT_EXPRESSION,
-                        scraperContext.scraper.name,
-                        scraperHandler.name,
-                        it.message,
-                    )
-                }) {
-                    with(scraperContext) {
-                        scraperHandler.action.jexlExpression
-                            .compute(List::class)
-                            .valueOrNull
-                    }
-                }?.let { actions ->
-                    coroutineScope {
-                        actions.forEachIndexed { index, value ->
-                            launch {
-                                scrap(
-                                    scraperContext.branch(
-                                        visitedHandlerName = scraperHandler.name,
-                                        openGates = scraperHandler.opensGates,
-                                        closeGates = scraperHandler.closesGates,
-                                        valueOrNull = value,
-                                    ),
+    private suspend fun SendChannel<ScraperResponse>.scrap(scraperContext: ScraperContext): Unit =
+        withContext(observationRegistry.asContextElement()) {
+            coroutineScope {
+                val scraperHandler =
+                    runCatching(logger, {
+                        when (it) {
+                            is ScraperHandlerNotFoundException ->
+                                ScraperResponseError(
+                                    ScraperResponseErrorCode.HANDLER_NOT_FOUND,
+                                    scraperContext.scraper.name,
+                                    null,
+                                    "Could not find an handler for specification '${scraperContext.scraper.name}'",
                                 )
-                            }
-                        }
-                    }
-                }
 
-            is ScraperComputeAction ->
-                with(scraperContext) {
-                    val mappedValues =
+                            else ->
+                                ScraperResponseError(
+                                    ScraperResponseErrorCode.COMPUTE_HANDLER,
+                                    scraperContext.scraper.name,
+                                    null,
+                                    it.message,
+                                )
+                        }
+                    }) {
+                        with(scraperContext) {
+                            scraper.handlers.firstOrNull { handler ->
+                                handler.matches?.takeUnless { it.compute(Boolean::class).valueOrNull == true } == null &&
+                                    handler.requiresGates
+                                        .compute(String::class)
+                                        .mapNotNull { it.valueOrNull }
+                                        .let(gates::containsAll)
+                            }
+                        } ?: throw ScraperHandlerNotFoundException(scraperContext.scraper.name)
+                    } ?: return@coroutineScope
+
+                logger.info("Scraper handler: (name={})", scraperHandler.name)
+
+                when (scraperHandler.action) {
+                    is ScraperFlatAction ->
                         runCatching(logger, {
                             ScraperResponseError(
-                                ScraperResponseErrorCode.COMPUTE_MAPS_EXPRESSION,
+                                ScraperResponseErrorCode.COMPUTE_FLAT_EXPRESSION,
                                 scraperContext.scraper.name,
                                 scraperHandler.name,
                                 it.message,
                             )
                         }) {
-                            scraperHandler.action.maps
-                                .compute()
-                                .mapNotNull { it.valueOrNull }
-                        } ?: return
-
-                    val requestValueHolder =
-                        when (scraperHandler.action) {
-                            is ScraperMapAction -> null
-                            is ScraperRequestAction ->
-                                scraperHandler.action.let { request ->
-                                    val httpRequest =
-                                        runCatching(logger, {
-                                            ScraperResponseError(
-                                                ScraperResponseErrorCode.COMPUTE_REQUEST,
-                                                scraperContext.scraper.name,
-                                                scraperHandler.name,
-                                                it.message,
-                                            )
-                                        }) {
-                                            val defaultUriComponents = scraper.defaultUrl.computeUri()
-                                            val uriComponents = request.url.computeUri(defaultUriComponents)
-
-                                            val uri = uriComponents.toUri()
-                                            val defaultHeaders =
-                                                scraper.defaultHeaders
-                                                    .compute(String::class)
-                                                    .mapEachValue { it.valueOrNull }
-                                            val headers =
-                                                request.headers
-                                                    .compute(String::class)
-                                                    .mapEachValue { it.valueOrNull }
-                                            val fields =
-                                                request.payload
-                                                    ?.fields
-                                                    ?.compute(String::class)
-                                                    ?.mapEachValue { it.valueOrNull }
-                                                    ?.asMultiValueMap()
-                                            val contentType =
-                                                request.payload?.let { payload ->
-                                                    when (payload.type) {
-                                                        ScraperPayloadType.DATA -> MediaType.APPLICATION_FORM_URLENCODED
-                                                        ScraperPayloadType.JSON -> MediaType.APPLICATION_JSON
-                                                    }
-                                                }
-                                            val accept =
-                                                when (request.parser) {
-                                                    ScraperSpecificationRequestParser.HTML -> MediaType.TEXT_HTML
-                                                    ScraperSpecificationRequestParser.JSON -> MediaType.APPLICATION_JSON
-                                                    ScraperSpecificationRequestParser.TEXT -> MediaType.TEXT_PLAIN
-                                                }
-
-                                            HttpRequest(
-                                                uri,
-                                                request.method,
-                                                defaultHeaders + headers +
-                                                    mapOf(
-                                                        HttpHeaders.ACCEPT to "$accept",
-                                                        HttpHeaders.CONTENT_TYPE to "$contentType",
-                                                    ),
-                                                fields,
-                                            )
-                                        } ?: return
-
-                                    runCatching(logger, {
-                                        ScraperResponseError(
-                                            ScraperResponseErrorCode.COMPUTE_RESPONSE,
-                                            scraperContext.scraper.name,
-                                            scraperHandler.name,
-                                            it.message,
-                                        )
-                                    }) {
-                                        val response = scraper.httpStatefulClient.exchange(httpRequest)
-                                        val responseBodyContext = copy(valueOrNull = response.body)
-                                        response.uri to
-                                            when (request.parser) {
-                                                ScraperSpecificationRequestParser.HTML -> responseBodyContext.html()
-                                                ScraperSpecificationRequestParser.JSON -> responseBodyContext.json()
-                                                ScraperSpecificationRequestParser.TEXT -> responseBodyContext
-                                            }
-                                    } ?: return
+                            with(scraperContext) {
+                                scraperHandler.action.jexlExpression
+                                    .compute(List::class)
+                                    .valueOrNull
+                            }
+                        }?.let { actions ->
+                            actions.forEach {
+                                launch {
+                                    scrap(
+                                        scraperContext.branch(
+                                            visitedHandlerName = scraperHandler.name,
+                                            openGates = scraperHandler.opensGates,
+                                            closeGates = scraperHandler.closesGates,
+                                            valueOrNull = it,
+                                        ),
+                                    )
                                 }
+                            }
                         }
 
-                    val requestValues = requestValueHolder?.second?.valueOrNull?.let(::listOf) ?: emptyList()
-                    requestValueHolder?.first to requestValues + mappedValues
-                }.let { (uri, output) ->
-                    scrap(
-                        scraperContext.branch(
-                            visitedHandlerName = scraperHandler.name,
-                            openGates = scraperHandler.opensGates,
-                            closeGates = scraperHandler.closesGates,
-                            uri =
-                                uri?.let {
-                                    UriComponentsBuilder
-                                        .fromUri(it)
-                                        .build()
-                                },
-                            valueOrNull = if (output.size == 1) output[0] else output,
-                        ),
-                    )
-                }
-
-            is ScraperReturnAction ->
-                send(
-                    runCatching(logger, {
-                        ScraperResponseError(
-                            ScraperResponseErrorCode.COMPUTE_RETURN,
-                            scraperContext.scraper.name,
-                            scraperHandler.name,
-                            it.message,
-                        )
-                    }) {
+                    is ScraperComputeAction ->
                         with(scraperContext) {
-                            ScraperResponseResult(
-                                scraper.defaultUrl
-                                    .computeUri()
-                                    .toUriString(),
-                                scraper.name,
-                                scraperHandler.action.description.computeDescription(),
-                                ScraperResponseResultBrand(
-                                    scraperHandler.action.brand.description
-                                        .computeBrand(),
-                                    scraperHandler.action.brand.image
-                                        .computeUriStringOrNull(),
-                                ),
-                                scraperHandler.action.price.computePriceAsync(),
-                                scraperHandler.action.image.computeUriStringOrNull(),
-                                scraperHandler.action.stocks.computeStocksAsync(),
-                                scraperHandler.action.grip.computeGradingOrNull(),
-                                scraperHandler.action.noise.computeNoiseLevelOrNull(),
-                                scraperHandler.action.decibels.computeDecibelsOrNull(),
-                                scraperHandler.action.consumption.computeGradingOrNull(),
-                                scraperHandler.action.details.mapNotNull {
-                                    it.name
-                                        .computeTextOrNull()
-                                        ?.let { name ->
-                                            it.description
-                                                .computeTextOrNull()
-                                                ?.let { description ->
-                                                    ScraperResponseResultDescriptiveDetail(
-                                                        name,
-                                                        description,
-                                                        it.image.computeUriStringOrNull(),
+                            val mappedValues =
+                                runCatching(logger, {
+                                    ScraperResponseError(
+                                        ScraperResponseErrorCode.COMPUTE_MAPS_EXPRESSION,
+                                        scraperContext.scraper.name,
+                                        scraperHandler.name,
+                                        it.message,
+                                    )
+                                }) {
+                                    scraperHandler.action.maps
+                                        .compute()
+                                        .mapNotNull { it.valueOrNull }
+                                } ?: return@coroutineScope
+
+                            val requestValueHolder =
+                                when (scraperHandler.action) {
+                                    is ScraperMapAction -> null
+                                    is ScraperRequestAction ->
+                                        scraperHandler.action.let { request ->
+                                            val httpRequest =
+                                                runCatching(logger, {
+                                                    ScraperResponseError(
+                                                        ScraperResponseErrorCode.COMPUTE_REQUEST,
+                                                        scraperContext.scraper.name,
+                                                        scraperHandler.name,
+                                                        it.message,
                                                     )
-                                                }
-                                                ?: it.image
-                                                    .computeUriStringOrNull()
-                                                    ?.let { image ->
-                                                        ScraperResponseResultDescriptionlessDetail(
-                                                            name,
-                                                            image,
-                                                        )
+                                                }) {
+                                                    val defaultUriComponents = scraper.defaultUrl.computeUri()
+                                                    val uriComponents = request.url.computeUri(defaultUriComponents)
+
+                                                    val uri = uriComponents.toUri()
+                                                    val defaultHeaders =
+                                                        scraper.defaultHeaders
+                                                            .compute(String::class)
+                                                            .mapEachValue { it.valueOrNull }
+                                                    val headers =
+                                                        request.headers
+                                                            .compute(String::class)
+                                                            .mapEachValue { it.valueOrNull }
+                                                    val fields =
+                                                        request.payload
+                                                            ?.fields
+                                                            ?.compute(String::class)
+                                                            ?.mapEachValue { it.valueOrNull }
+                                                            ?.asMultiValueMap()
+                                                    val contentType =
+                                                        request.payload?.let { payload ->
+                                                            when (payload.type) {
+                                                                ScraperPayloadType.DATA -> MediaType.APPLICATION_FORM_URLENCODED
+                                                                ScraperPayloadType.JSON -> MediaType.APPLICATION_JSON
+                                                            }
+                                                        }
+                                                    val accept =
+                                                        when (request.parser) {
+                                                            ScraperSpecificationRequestParser.HTML -> MediaType.TEXT_HTML
+                                                            ScraperSpecificationRequestParser.JSON -> MediaType.APPLICATION_JSON
+                                                            ScraperSpecificationRequestParser.TEXT -> MediaType.TEXT_PLAIN
+                                                        }
+
+                                                    HttpRequest(
+                                                        uri,
+                                                        request.method,
+                                                        defaultHeaders + headers +
+                                                            mapOf(
+                                                                HttpHeaders.ACCEPT to "$accept",
+                                                                HttpHeaders.CONTENT_TYPE to "$contentType",
+                                                            ),
+                                                        fields,
+                                                    )
+                                                } ?: return@coroutineScope
+
+                                            runCatching(logger, {
+                                                ScraperResponseError(
+                                                    ScraperResponseErrorCode.COMPUTE_RESPONSE,
+                                                    scraperContext.scraper.name,
+                                                    scraperHandler.name,
+                                                    it.message,
+                                                )
+                                            }) {
+                                                val response = scraper.httpStatefulClient.exchange(httpRequest)
+                                                val responseBodyContext = copy(valueOrNull = response.body)
+                                                response.uri to
+                                                    when (request.parser) {
+                                                        ScraperSpecificationRequestParser.HTML -> responseBodyContext.html()
+                                                        ScraperSpecificationRequestParser.JSON -> responseBodyContext.json()
+                                                        ScraperSpecificationRequestParser.TEXT -> responseBodyContext
                                                     }
+                                            } ?: return@coroutineScope
                                         }
-                                },
+                                }
+
+                            val requestValues = requestValueHolder?.second?.valueOrNull?.let(::listOf) ?: emptyList()
+                            requestValueHolder?.first to requestValues + mappedValues
+                        }.let { (uri, output) ->
+                            scrap(
+                                scraperContext.branch(
+                                    visitedHandlerName = scraperHandler.name,
+                                    openGates = scraperHandler.opensGates,
+                                    closeGates = scraperHandler.closesGates,
+                                    uri =
+                                        uri?.let {
+                                            UriComponentsBuilder
+                                                .fromUri(it)
+                                                .build()
+                                        },
+                                    valueOrNull = if (output.size == 1) output[0] else output,
+                                ),
                             )
                         }
-                    } ?: return,
-                )
+
+                    is ScraperReturnAction ->
+                        send(
+                            runCatching(logger, {
+                                ScraperResponseError(
+                                    ScraperResponseErrorCode.COMPUTE_RETURN,
+                                    scraperContext.scraper.name,
+                                    scraperHandler.name,
+                                    it.message,
+                                )
+                            }) {
+                                with(scraperContext) {
+                                    ScraperResponseResult(
+                                        scraper.defaultUrl
+                                            .computeUri()
+                                            .toUriString(),
+                                        scraper.name,
+                                        scraperHandler.action.description.computeDescription(),
+                                        ScraperResponseResultBrand(
+                                            scraperHandler.action.brand.description
+                                                .computeBrand(),
+                                            scraperHandler.action.brand.image
+                                                .computeUriStringOrNull(),
+                                        ),
+                                        scraperHandler.action.price.computePriceAsync(),
+                                        scraperHandler.action.image.computeUriStringOrNull(),
+                                        scraperHandler.action.stocks.computeStocksAsync(),
+                                        scraperHandler.action.grip.computeGradingOrNull(),
+                                        scraperHandler.action.noise.computeNoiseLevelOrNull(),
+                                        scraperHandler.action.decibels.computeDecibelsOrNull(),
+                                        scraperHandler.action.consumption.computeGradingOrNull(),
+                                        scraperHandler.action.details.mapNotNull {
+                                            it.name
+                                                .computeTextOrNull()
+                                                ?.let { name ->
+                                                    it.description
+                                                        .computeTextOrNull()
+                                                        ?.let { description ->
+                                                            ScraperResponseResultDescriptiveDetail(
+                                                                name,
+                                                                description,
+                                                                it.image.computeUriStringOrNull(),
+                                                            )
+                                                        }
+                                                        ?: it.image
+                                                            .computeUriStringOrNull()
+                                                            ?.let { image ->
+                                                                ScraperResponseResultDescriptionlessDetail(
+                                                                    name,
+                                                                    image,
+                                                                )
+                                                            }
+                                                }
+                                        },
+                                    )
+                                }
+                            }?.also { logger.info("Emitted {}", it.description) } ?: return@coroutineScope,
+                        )
+                }
+            }
         }
-    }
 }

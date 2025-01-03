@@ -241,7 +241,7 @@ suspend fun <T : Any> JexlValueHolder<T>.dateAsync(): JexlValueHolder<DateTimeVa
             else ->
                 mapAsync { text ->
                     context.ducklingClient
-                        .parse(DucklingDateTimeRequest(text, context.locale, context.timezone))
+                        .parseAsync(DucklingDateTimeRequest(text, context.locale, context.timezone))
                         ?.value
                         ?.let { responseValue ->
                             when (responseValue) {
