@@ -2,11 +2,14 @@ name: Test
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev'
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/dev'
     steps:
       - name: Greeting
         run: echo "Run successfully"
